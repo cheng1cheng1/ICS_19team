@@ -1,0 +1,103 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <vector>
+
+__mlu_entry__ void masked_count_kernel(const float *input,
+                                       int32_t *counts,
+                                       int total,
+                                       float threshold) {
+    int chunk = (total + taskDim - 1) / taskDim;
+    int start = taskId * chunk;
+    int end = start + chunk;
+    if (end > total) {
+        end = total;
+    }
+
+    int32_t count = 0;
+    for (int i = start; i < end; ++i) {
+        if (input[i] > threshold) {
+            ++count;
+        }
+    }
+    counts[taskId] = count;
+}
+
+__mlu_entry__ void masked_write_kernel(const float *input,
+                                       const int32_t *offsets,
+                                       float *output,
+                                       int total,
+                                       float threshold) {
+    int chunk = (total + taskDim - 1) / taskDim;
+    int start = taskId * chunk;
+    int end = start + chunk;
+    if (end > total) {
+        end = total;
+    }
+
+    int32_t pos = offsets[taskId];
+    for (int i = start; i < end; ++i) {
+        float v = input[i];
+        if (v > threshold) {
+            output[pos] = v;
+            ++pos;
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input, double threshold) {
+    auto input_c = input.to(torch::kFloat32).contiguous();
+    int total = static_cast<int>(input_c.numel());
+
+    uint32_t task_num = 16;
+    if (total < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(total);
+    }
+    if (task_num == 0) {
+        return torch::empty({0}, input_c.options().dtype(torch::kFloat32));
+    }
+
+    auto counts_mlu = torch::empty({static_cast<int64_t>(task_num)},
+                                   input_c.options().dtype(torch::kInt32));
+
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    masked_count_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const float *>(input_c.data_ptr()),
+        reinterpret_cast<int32_t *>(counts_mlu.data_ptr()),
+        total,
+        static_cast<float>(threshold));
+
+    auto counts_cpu = counts_mlu.cpu();
+    const int32_t *counts = reinterpret_cast<const int32_t *>(counts_cpu.data_ptr());
+
+    std::vector<int32_t> offsets(task_num);
+    int64_t selected = 0;
+    for (uint32_t i = 0; i < task_num; ++i) {
+        offsets[i] = static_cast<int32_t>(selected);
+        selected += counts[i];
+    }
+
+    auto output = torch::empty({selected}, input_c.options().dtype(torch::kFloat32));
+    if (selected == 0) {
+        return output;
+    }
+
+    auto offsets_cpu = torch::from_blob(offsets.data(),
+                                        {static_cast<int64_t>(task_num)},
+                                        torch::TensorOptions().dtype(torch::kInt32))
+                           .clone();
+    auto offsets_mlu = offsets_cpu.to(input_c.device());
+
+    masked_write_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const float *>(input_c.data_ptr()),
+        reinterpret_cast<const int32_t *>(offsets_mlu.data_ptr()),
+        reinterpret_cast<float *>(output.data_ptr()),
+        total,
+        static_cast<float>(threshold));
+
+    return output;
+}
