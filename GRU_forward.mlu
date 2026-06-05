@@ -15,10 +15,6 @@ __mlu_entry__ void zero_float_kernel(float *ptr, int total) {
     }
 }
 
-static inline float sigmoid_scalar(float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
-
 __mlu_entry__ void gru_layer_step_kernel(const float *input,
                                          const float *h_prev,
                                          const float *weight_ih,
@@ -70,9 +66,10 @@ __mlu_entry__ void gru_layer_step_kernel(const float *input,
             gate_n_hidden += w_hn[i] * prev;
         }
 
-        float r = sigmoid_scalar(gate_r);
-        float z = sigmoid_scalar(gate_z);
-        float n = tanhf(gate_n_in + r * gate_n_hidden);
+        float r = 1.0f / (1.0f + expf(-gate_r));
+        float z = 1.0f / (1.0f + expf(-gate_z));
+        float n_arg = gate_n_in + r * gate_n_hidden;
+        float n = 2.0f / (1.0f + expf(-2.0f * n_arg)) - 1.0f;
         float prev_h = h_t_prev[h];
         float next_h = (1.0f - z) * n + z * prev_h;
 

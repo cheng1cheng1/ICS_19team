@@ -1,0 +1,137 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+
+#define MAX_W 128
+
+__mlu_entry__ void dilated_conv2d_kernel(const half *x,
+                                         const half *weight,
+                                         half *out,
+                                         int batch,
+                                         int in_channels,
+                                         int out_channels,
+                                         int H,
+                                         int W,
+                                         int kernel_size,
+                                         int dilation,
+                                         int padding,
+                                         int H_out,
+                                         int W_out) {
+    __nram__ half nram_in_h[MAX_W];
+    __nram__ half nram_out_h[MAX_W];
+    __nram__ float nram_in_f[MAX_W];
+    __nram__ float nram_out_f[MAX_W];
+    __nram__ float nram_tmp_f[MAX_W];
+
+    int total_rows = batch * out_channels * H_out;
+
+    for (int row_task = taskId; row_task < total_rows; row_task += taskDim) {
+        int oy = row_task % H_out;
+        int tmp = row_task / H_out;
+        int oc = tmp % out_channels;
+        int b = tmp / out_channels;
+
+        __bang_write_value(nram_out_f, MAX_W, 0.0f);
+
+        for (int ic = 0; ic < in_channels; ++ic) {
+            for (int ky = 0; ky < kernel_size; ++ky) {
+                int iy = oy - padding + ky * dilation;
+                if (iy < 0 || iy >= H) {
+                    continue;
+                }
+
+                const half *input_row = x + ((b * in_channels + ic) * H + iy) * W;
+                __memcpy(nram_in_h, input_row, W * sizeof(half), GDRAM2NRAM);
+                __bang_half2float(nram_in_f, nram_in_h, MAX_W);
+
+                for (int kx = 0; kx < kernel_size; ++kx) {
+                    int out_start = padding - kx * dilation;
+                    if (out_start < 0) {
+                        out_start = 0;
+                    }
+
+                    int out_end = W + padding - kx * dilation;
+                    if (out_end > W_out) {
+                        out_end = W_out;
+                    }
+
+                    int len = out_end - out_start;
+                    if (len <= 0) {
+                        continue;
+                    }
+
+                    int in_start = out_start - padding + kx * dilation;
+                    float wv = (float)weight[((oc * in_channels + ic) * kernel_size + ky) * kernel_size + kx];
+
+                    __bang_mul_scalar(nram_tmp_f, nram_in_f + in_start, wv, len);
+                    __bang_add(nram_out_f + out_start,
+                               nram_out_f + out_start,
+                               nram_tmp_f,
+                               len);
+                }
+            }
+        }
+
+        __bang_float2half_rn(nram_out_h, nram_out_f, MAX_W);
+        __memcpy(out + ((b * out_channels + oc) * H_out + oy) * W_out,
+                 nram_out_h,
+                 W_out * sizeof(half),
+                 NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x,
+                        torch::Tensor kernel,
+                        int in_channels,
+                        int out_channels,
+                        int kernel_size,
+                        int dilation,
+                        int padding) {
+    TORCH_CHECK(x.dim() == 4, "Input tensor x must be 4D");
+    TORCH_CHECK(in_channels == x.size(1), "in_channels does not match x");
+    TORCH_CHECK(kernel.size(0) == out_channels, "kernel out_channels mismatch");
+    TORCH_CHECK(kernel.size(1) == in_channels, "kernel in_channels mismatch");
+    TORCH_CHECK(kernel.size(2) == kernel_size, "kernel height mismatch");
+    TORCH_CHECK(kernel.size(3) == kernel_size, "kernel width mismatch");
+
+    auto x_c = x.to(torch::kHalf).contiguous();
+    auto kernel_c = kernel.to(torch::kHalf).contiguous();
+
+    int batch = static_cast<int>(x_c.size(0));
+    int H = static_cast<int>(x_c.size(2));
+    int W = static_cast<int>(x_c.size(3));
+    int H_out = (H + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+    int W_out = (W + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+
+    TORCH_CHECK(W <= MAX_W && W_out <= MAX_W, "This implementation expects width <= 128");
+
+    auto out = torch::empty({batch, out_channels, H_out, W_out}, x.options());
+
+    int total_rows = batch * out_channels * H_out;
+    uint32_t task_num = 16;
+    if (total_rows < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(total_rows);
+    }
+
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    dilated_conv2d_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(x_c.data_ptr()),
+        reinterpret_cast<const half *>(kernel_c.data_ptr()),
+        reinterpret_cast<half *>(out.data_ptr()),
+        batch,
+        in_channels,
+        out_channels,
+        H,
+        W,
+        kernel_size,
+        dilation,
+        padding,
+        H_out,
+        W_out);
+
+    return out;
+}
