@@ -1,6 +1,7 @@
 #include <bang.h>
 #include <cnrt.h>
 #include <torch/extension.h>
+<<<<<<< HEAD
 #include <math.h>
 
 #define TILE_ELEMS 1024
@@ -47,10 +48,69 @@ __mlu_global__ void cumsum_kernel(const half *x,
                 y[index] = nram_half[i];
             }
         }
+=======
+#include <framework/core/MLUStream.h>
+
+#define COLS 4000
+#define PAD_COLS 4096
+#define TASK_NUM 16
+#define ALIGN 64
+
+__mlu_entry__ void cumsum_kernel(const half *x,
+                                 half *y,
+                                 int rows,
+                                 int cols) {
+    __nram__ half nram_h[PAD_COLS];
+    __nram__ float nram_f[PAD_COLS];
+    __nram__ float nram_tmp[PAD_COLS];
+
+    for (int row = taskId; row < rows; row += taskDim) {
+        int base = row * cols;
+
+        __memcpy(nram_h,
+                 x + base,
+                 cols * sizeof(half),
+                 GDRAM2NRAM);
+
+        for (int i = cols; i < PAD_COLS; ++i) {
+            nram_h[i] = (half)0.0f;
+        }
+
+        __bang_half2float(nram_f, nram_h, PAD_COLS);
+
+        for (int step = 1; step < PAD_COLS; step <<= 1) {
+            __memcpy(nram_tmp,
+                     nram_f,
+                     PAD_COLS * sizeof(float),
+                     NRAM2NRAM);
+
+            int len = PAD_COLS - step;
+            int vec_len = (len / ALIGN) * ALIGN;
+
+            if (vec_len > 0) {
+                __bang_add(nram_f + step,
+                           nram_tmp + step,
+                           nram_tmp,
+                           vec_len);
+            }
+
+            for (int i = vec_len; i < len; ++i) {
+                nram_f[step + i] = nram_tmp[step + i] + nram_tmp[i];
+            }
+        }
+
+        __bang_float2half_rn(nram_h, nram_f, PAD_COLS);
+
+        __memcpy(y + base,
+                 nram_h,
+                 cols * sizeof(half),
+                 NRAM2GDRAM);
+>>>>>>> 5cf4022cbbc2e4dc0959d018c4990a6882517ce3
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
+<<<<<<< HEAD
     auto x_contiguous = x.contiguous();
     auto output = torch::empty_like(x_contiguous);
 
@@ -103,3 +163,26 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
 
     return output;
 }
+=======
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input must be float16");
+
+    auto x_c = x.contiguous();
+    auto out = torch::empty_like(x_c);
+
+    int rows = x_c.size(0);
+    int cols = x_c.size(1);
+
+    cnrtDim3_t grid_dim = {TASK_NUM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cumsum_kernel<<<grid_dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(x_c.data_ptr()),
+        reinterpret_cast<half *>(out.data_ptr()),
+        rows,
+        cols
+    );
+
+    return out;
+}
+>>>>>>> 5cf4022cbbc2e4dc0959d018c4990a6882517ce3
